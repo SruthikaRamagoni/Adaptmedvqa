@@ -346,13 +346,13 @@ class TrainingAgent:
         hf_id        = active_plan["hf_id"]
         name         = active_plan["name"]
         architecture = active_plan.get("architecture",          "seq2seq")
-        lora_r       = active_plan.get("lora_r",                8)
-        lora_alpha   = active_plan.get("lora_alpha",            16)
-        lora_drop    = active_plan.get("lora_dropout",          0.05)
+        lora_r       = active_plan.get("lora_r",                16)
+        lora_alpha   = active_plan.get("lora_alpha",            32)
+        lora_drop    = active_plan.get("lora_dropout",          1)
         target_mods  = active_plan.get("target_modules",        ["q", "v"])
         batch_size   = active_plan.get("batch_size",            2)
         epochs       = active_plan.get("epochs",                5)
-        lr           = active_plan.get("learning_rate",         2e-4)
+        lr           = active_plan.get("learning_rate",         8e-5)
         precision    = active_plan.get("precision",             "fp16")
         max_grad_norm = active_plan.get("max_grad_norm",         1.0)
         es_patience   = active_plan.get("early_stopping_patience", 2)
