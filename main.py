@@ -1,308 +1,481 @@
 #!/usr/bin/env python3
 """
-inference.py — Standalone inference for the trained Medical VQA model.
+main.py — Medical VQA PhiData Multi-Agent Pipeline
 
-Loads a fine-tuned LoRA checkpoint and generates a free-text answer
-for any image + question pair.
+8-stage pipeline:
+  1. ModalityDiscoveryAgent    — detect imaging modality
+  2. DataDiscoveryAgent        — find best free dataset
+  3. DataCollectionAgent       — download + cache
+  4. DataPreprocessingAgent    — clean, resize, anonymize
+  5. ModelSelectionAgent       — pick best model for GPU
+  6. FeatureEngineeringAgent   — encode to model-specific tensors  ← NEW
+  7. TrainingAgent             — PEFT/LoRA fine-tuning
+  8. EvaluationAgent           — BLEU, ROUGE, EM, Medical Accuracy
 
-Usage (CLI):
-    python inference.py \
-        --image path/to/xray.jpg \
-        --question "Is there pneumonia?" \
-        --checkpoint ./artifacts/checkpoints/Qwen2.5-VL-3B
+Run:
+    python main.py --image image.jpg --question "Is there pneumonia?"
+    python main.py --image image.jpg --question "..." --dry-run
+    python main.py --image image.jpg --question "..." --skip-training --checkpoint ./artifacts/checkpoints/Flan-T5-Base
 
-    python inference.py \
-        --image img.png \
-        --question "What organ is shown?" \
-        --model-id google/flan-t5-base      # use base model, no checkpoint
+FIX (this revision):
+    main.py previously passed a single `--groq-model` text-reasoning model ID
+    (default: llama-3.1-8b-instant) into EVERY agent, including
+    ModalityDiscoveryAgent. That agent's low-confidence fallback path needs a
+    *vision-capable* Groq model to actually look at the image — but it was
+    always being constructed with the shared text-only reasoning model,
+    which Groq rejects for image+text payloads with a 400
+    ("messages[1].content must be a string"). The agent's internal
+    `VISION_MODEL_ID` default was therefore always being silently
+    overridden and never took effect.
 
-Python API:
-    from inference import run_inference
-    answer = run_inference(
-        image_path="chest.jpg",
-        question="Is there cardiomegaly?",
-        checkpoint_path="./artifacts/checkpoints/...",
-        model_hf_id="Qwen/Qwen2.5-VL-3B-Instruct",
-    )
+    Fix: ModalityDiscoveryAgent is now constructed WITHOUT passing `model_id`,
+    so it uses its own internal vision-capable default
+    (meta-llama/llama-4-scout-17b-16e-instruct as of this writing). A new
+    `--vision-model` CLI flag lets you override that independently of
+    `--groq-model`, which still controls the text-reasoning model used by
+    every other agent.
 """
 
-from __future__ import annotations
 import argparse, json, logging, sys
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
-
-logger = logging.getLogger(__name__)
-
-
-# ── Main API ──────────────────────────────────────────────────────────────────
-
-def run_inference(
-    image_path: str,
-    question: str,
-    checkpoint_path: str = "",
-    model_hf_id: str = "",
-    device: str = "",
-    max_new_tokens: int = 128,
-    temperature: float = 0.3,
-    do_sample: bool = True,
-) -> str:
-    """
-    Generate a natural-language answer for image + question.
-
-    Args:
-        image_path:      Path to the medical image (jpg / png / dcm).
-        question:        Clinical question string.
-        checkpoint_path: Path to fine-tuned LoRA adapter directory (optional).
-        model_hf_id:     HuggingFace base model ID (auto-resolved from checkpoint if empty).
-        device:          'cuda' | 'cpu' | 'mps' | '' (auto-detect).
-        max_new_tokens:  Max tokens to generate.
-        temperature:     Sampling temperature.
-        do_sample:       Whether to sample; False = greedy decoding.
-
-    Returns:
-        Generated answer string.
-    """
-    import torch
-
-    # ── Device ───────────────────────────────────────────────────────────────
-    if not device:
-        if torch.cuda.is_available():          device = "cuda"
-        elif torch.backends.mps.is_available():device = "mps"
-        else:                                  device = "cpu"
-    logger.info(f"[Inference] device={device}")
-
-    # ── Resolve model ID ─────────────────────────────────────────────────────
-    hf_id = model_hf_id or _resolve_hf_id(checkpoint_path, device)
-    logger.info(f"[Inference] base model={hf_id}")
-
-    # ── Load model + processor ────────────────────────────────────────────────
-    model, processor = _load_model(hf_id, device)
-
-    # ── Apply LoRA adapters ───────────────────────────────────────────────────
-    if checkpoint_path and Path(checkpoint_path).exists():
-        model = _apply_lora(model, checkpoint_path)
-
-    model.eval()
-
-    # ── Load image ────────────────────────────────────────────────────────────
-    image = None
-    if image_path and Path(image_path).exists():
-        try:
-            from PIL import Image
-            image = Image.open(image_path).convert("RGB")
-            logger.info(f"[Inference] image loaded: {image_path} {image.size}")
-        except Exception as e:
-            logger.warning(f"[Inference] Could not load image: {e}")
-
-    # ── Build prompt ──────────────────────────────────────────────────────────
-    prompt = _build_prompt(question, hf_id, has_image=image is not None)
-
-    # ── Generate ──────────────────────────────────────────────────────────────
-    answer = _generate(model, processor, prompt, image, device,
-                        max_new_tokens, temperature, do_sample)
-    logger.info(f"[Inference] answer: {answer}")
-    return answer
+from config.settings import MAX_MODEL_RETRIES
+from core.state import PipelineState
+from agents.modality_discovery_agent  import ModalityDiscoveryAgent
+from agents.data_discovery_agent      import DataDiscoveryAgent
+from agents.data_collection_agent     import DataCollectionAgent
+from agents.data_preprocessing_agent  import DataPreprocessingAgent
+from agents.model_selection_agent     import ModelSelectionAgent
+from agents.feature_engineering_agent import FeatureEngineeringAgent
+from agents.training_agent            import TrainingAgent
+from agents.evaluation_agent          import EvaluationAgent
 
 
-# ── Batch inference ───────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 
-def run_batch_inference(
-    samples: list,
-    checkpoint_path: str = "",
-    model_hf_id: str = "",
-    device: str = "",
-    max_new_tokens: int = 128,
-) -> list:
-    """
-    Run inference on a list of {'image_path': str, 'question': str} dicts.
-    Loads model once, iterates over samples.
-    """
-    import torch
-    if not device:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    hf_id = model_hf_id or _resolve_hf_id(checkpoint_path, device)
-    model, processor = _load_model(hf_id, device)
-    if checkpoint_path and Path(checkpoint_path).exists():
-        model = _apply_lora(model, checkpoint_path)
-    model.eval()
-
-    results = []
-    for s in samples:
-        img_path = s.get("image_path", "")
-        question = s.get("question", "")
-        image = None
-        if img_path and Path(img_path).exists():
-            from PIL import Image
-            image = Image.open(img_path).convert("RGB")
-
-        prompt = _build_prompt(question, hf_id, has_image=image is not None)
-        answer = _generate(model, processor, prompt, image, device,
-                            max_new_tokens, 0.3, False)
-        results.append({"image_path": img_path, "question": question, "answer": answer})
-
-    return results
+def setup_logging(level: str = "INFO") -> None:
+    Path("./logs").mkdir(exist_ok=True)
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="[%(asctime)s][%(levelname)s][%(name)s] %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("./logs/pipeline.log", mode="a"),
+        ],
+    )
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Hardware ──────────────────────────────────────────────────────────────────
 
-def _resolve_hf_id(checkpoint_path: str, device: str) -> str:
-    """Read hf_id from checkpoint model_plan.json, or choose a safe default."""
-    if checkpoint_path:
-        plan_file = Path(checkpoint_path) / "model_plan.json"
-        if plan_file.exists():
-            try:
-                return json.load(open(plan_file)).get("hf_id", "")
-            except Exception:
-                pass
-    import torch
-    vram = 0.0
-    if torch.cuda.is_available():
-        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if device == "cuda" and vram >= 6:
-        return "Qwen/Qwen2.5-VL-3B-Instruct"
-    return "google/flan-t5-base"   # always safe CPU fallback
-
-
-def _load_model(hf_id: str, device: str):
-    import torch
-    from transformers import AutoTokenizer
-    dtype = torch.float16 if device == "cuda" else torch.float32
-    load_kw = dict(pretrained_model_name_or_path=hf_id, trust_remote_code=True, torch_dtype=dtype)
-    if device == "cuda":
-        load_kw["device_map"] = "auto"
-
-    model = None
-    for cls_name in ["AutoModelForVision2Seq", "AutoModelForCausalLM", "AutoModelForSeq2SeqLM"]:
-        try:
-            import transformers as tf
-            cls = getattr(tf, cls_name, None)
-            if cls:
-                model = cls.from_pretrained(**load_kw)
-                logger.info(f"[Inference] Loaded with {cls_name}")
-                break
-        except Exception:
-            continue
-
-    if model is None:
-        raise RuntimeError(f"Cannot load model: {hf_id}")
-
-    if device not in ("cuda",):
-        try: model = model.to(device)
-        except Exception: pass
-
+def detect_hardware() -> dict:
+    import psutil
+    hw = {
+        "device":  "cpu",
+        "vram_gb": 0.0,
+        "ram_gb":  psutil.virtual_memory().total / 1e9,
+    }
     try:
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(hf_id, trust_remote_code=True)
-    except Exception:
-        processor = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
-
-    if hasattr(processor, "pad_token") and processor.pad_token is None:
-        processor.pad_token = processor.eos_token
-
-    return model, processor
-
-
-def _apply_lora(model, checkpoint_path: str):
-    try:
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, checkpoint_path)
-        model = model.merge_and_unload()
-        logger.info(f"[Inference] LoRA merged from {checkpoint_path}")
+        import torch
+        if torch.cuda.is_available():
+            hw["device"]  = "cuda"
+            hw["vram_gb"] = torch.cuda.get_device_properties(0).total_memory / 1e9
+            hw["gpu_name"]= torch.cuda.get_device_name(0)
+        elif torch.backends.mps.is_available():
+            hw["device"]  = "mps"
+            hw["vram_gb"] = hw["ram_gb"] * 0.5
     except ImportError:
-        logger.warning("[Inference] PEFT not installed; using base model.")
-    except Exception as e:
-        logger.warning(f"[Inference] LoRA load failed ({e}); using base model.")
-    return model
-
-
-def _build_prompt(question: str, hf_id: str, has_image: bool) -> str:
-    hid = hf_id.lower()
-    if "qwen" in hid:
-        if has_image:
-            return (f"<|im_start|>user\n"
-                    f"<|vision_start|><|image_pad|><|vision_end|>"
-                    f"{question}<|im_end|>\n<|im_start|>assistant\n")
-        return f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
-    if "phi" in hid:
-        return f"<|user|>\n{question}<|end|>\n<|assistant|>\n"
-    if "llava" in hid or "blip" in hid:
-        return f"Question: {question}\nAnswer:"
-    if "mistral" in hid:
-        return f"[INST] {question} [/INST]"
-    return f"Question: {question}\nAnswer:"
-
-
-def _generate(model, processor, prompt, image, device,
-              max_new_tokens, temperature, do_sample) -> str:
-    import torch
-    with torch.no_grad():
-        try:
-            if image is not None and hasattr(processor, "image_processor"):
-                if hasattr(processor, "apply_chat_template"):
-                    msgs = [{"role": "user", "content": [
-                        {"type": "image"}, {"type": "text", "text": prompt}
-                    ]}]
-                    text   = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-                    inputs = processor(text=text, images=[image], return_tensors="pt").to(device)
-                else:
-                    inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
-                out = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                      temperature=temperature if do_sample else 1.0,
-                                      do_sample=do_sample)
-                gen = out[0][inputs["input_ids"].shape[-1]:]
-                tok = getattr(processor, "tokenizer", processor)
-                return tok.decode(gen, skip_special_tokens=True).strip()
-            else:
-                tok    = getattr(processor, "tokenizer", processor)
-                inputs = tok(prompt, return_tensors="pt",
-                             truncation=True, max_length=512).to(device)
-                out = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                      temperature=temperature if do_sample else 1.0,
-                                      do_sample=do_sample,
-                                      pad_token_id=getattr(tok, "eos_token_id", 1))
-                gen = out[0][inputs["input_ids"].shape[-1]:]
-                return tok.decode(gen, skip_special_tokens=True).strip()
-        except Exception as e:
-            logger.error(f"[Inference] Generation error: {e}")
-            return f"[Error: {e}]"
+        pass
+    return hw
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def _parse_args():
-    p = argparse.ArgumentParser(description="Medical VQA Inference")
-    p.add_argument("--image",       required=True)
-    p.add_argument("--question",    required=True)
-    p.add_argument("--checkpoint",  default="")
-    p.add_argument("--model-id",    default="")
-    p.add_argument("--device",      default="", choices=["","cuda","cpu","mps"])
-    p.add_argument("--max-tokens",  type=int,   default=128)
-    p.add_argument("--temperature", type=float, default=0.3)
-    p.add_argument("--greedy",      action="store_true")
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Medical VQA PhiData Multi-Agent Pipeline",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--image",         required=True,
+                   help="Path to medical image (jpg/png/dcm)")
+    p.add_argument("--question",      required=True,
+                   help="Clinical question about the image")
+    p.add_argument("--groq-model",    default="llama-3.1-8b-instant",
+                   help="Groq TEXT-reasoning model ID used by every agent "
+                        "EXCEPT ModalityDiscoveryAgent's vision fallback "
+                        "(see --vision-model).")
+    p.add_argument("--vision-model",  default=None,
+                   help="Groq VISION-capable model ID used only by "
+                        "ModalityDiscoveryAgent's low-confidence fallback. "
+                        "If omitted, the agent's own internal default is "
+                        "used. Must be a model that accepts image input — "
+                        "passing a text-only model here will 400.")
+    p.add_argument("--max-samples",   type=int, default=5000,
+                   help="Maximum dataset samples to use")
+    p.add_argument("--dry-run",       action="store_true",
+                   help="10 samples, 1 epoch — fast end-to-end test")
+    p.add_argument("--skip-training", action="store_true",
+                   help="Skip training; evaluate an existing checkpoint")
+    p.add_argument("--checkpoint",    default="",
+                   help="Existing checkpoint path (use with --skip-training)")
+    p.add_argument("--log-level",     default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
 
 
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s][%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    args = _parse_args()
-    answer = run_inference(
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+
+def run_pipeline(args) -> PipelineState:
+    logger = logging.getLogger("main")
+    hw     = detect_hardware()
+    m      = args.groq_model
+
+    logger.info(f"Hardware: device={hw['device']}  "
+                f"VRAM={hw['vram_gb']:.1f}GB  RAM={hw['ram_gb']:.1f}GB")
+    logger.info(f"Groq text-reasoning model for agents: {m}")
+    if args.vision_model:
+        logger.info(f"Groq vision model override: {args.vision_model}")
+
+    state = PipelineState(
         image_path=args.image,
         question=args.question,
-        checkpoint_path=args.checkpoint,
-        model_hf_id=args.model_id,
-        device=args.device,
-        max_new_tokens=args.max_tokens,
-        temperature=args.temperature,
-        do_sample=not args.greedy,
+        device=hw["device"],
+        vram_gb=hw["vram_gb"],
+        ram_gb=hw["ram_gb"],
     )
-    print(f"\n{'='*55}")
-    print(f"  Question : {args.question}")
-    print(f"  Answer   : {answer}")
-    print(f"{'='*55}\n")
+
+    max_samples     = 10 if args.dry_run else args.max_samples
+    epochs_override = 1  if args.dry_run else 0
+
+    # ── STEP 1 — Modality Discovery ───────────────────────────────────────────
+    _banner(logger, "STEP 1 — Modality Discovery")
+    # IMPORTANT: do NOT pass the shared text-reasoning model `m` here.
+    # ModalityDiscoveryAgent's low-confidence path needs a vision-capable
+    # model to actually see the image; the shared `--groq-model` default
+    # (llama-3.1-8b-instant) is text-only and will 400 on image+text
+    # payloads ("messages[1].content must be a string"). Only pass an
+    # explicit override if the user supplied --vision-model; otherwise let
+    # the agent use its own internal vision-capable default.
+    modality_agent_kwargs = {}
+    if args.vision_model:
+        modality_agent_kwargs["model_id"] = args.vision_model
+    modality_agent  = ModalityDiscoveryAgent(**modality_agent_kwargs)
+    modality_result = modality_agent.discover_modality(args.image, args.question)
+    state.modality  = modality_result.get("modality", "Unknown")
+    state.log(f"Modality: {state.modality}  "
+               f"(conf={modality_result.get('confidence', 0):.2f})")
+    if modality_result.get("error"):
+        # Surface vision-call failures loudly rather than letting them slide
+        # by silently as a low-confidence "Unknown" with no trace in the
+        # pipeline summary.
+        state.errors.append(f"modality_discovery: {modality_result['error']}")
+        logger.warning(f"Modality discovery degraded: {modality_result['error']}")
+
+    # ── STEP 2 — Data Discovery ───────────────────────────────────────────────
+    _banner(logger, "STEP 2 — Data Discovery")
+    discovery_agent = DataDiscoveryAgent(model_id=m)
+    dataset_info    = discovery_agent.discover_dataset(state.modality)
+    state.dataset_name       = dataset_info["name"]
+    state.dataset_source     = dataset_info["source"]
+    state.dataset_local_path = dataset_info.get("local_path", "")
+    state.log(f"Dataset selected: {state.dataset_name}")
+
+    # ── STEP 3 — Data Collection ──────────────────────────────────────────────
+    _banner(logger, "STEP 3 — Data Collection")
+    collection_agent  = DataCollectionAgent(model_id=m, max_samples=max_samples)
+    collection_result = collection_agent.collect_dataset(dataset_info)
+    if collection_result.get("status") == "failed":
+        state.errors.append(collection_result.get("message", "Collection failed"))
+        logger.error(f"Collection failed: {collection_result['message']}")
+        state.save()
+        return state
+    state.raw_data_path = collection_result["cache_path"]
+    state.log(f"Collected {collection_result['records_count']} records → {state.raw_data_path}")
+
+    # ── STEP 4 — Data Preprocessing ───────────────────────────────────────────
+    _banner(logger, "STEP 4 — Data Preprocessing")
+    preprocess_agent  = DataPreprocessingAgent(model_id=m)
+    preprocess_result = preprocess_agent.preprocess(state.raw_data_path)
+    if preprocess_result.get("status") == "failed":
+        state.errors.append(preprocess_result.get("message", "Preprocessing failed"))
+        logger.error(f"Preprocessing failed: {preprocess_result['message']}")
+        state.save()
+        return state
+    state.processed_data_path = preprocess_result["processed_path"]
+    state.log(f"Preprocessed: {preprocess_result['valid_records']} valid records")
+
+    # ── STEP 5 — Model Selection ──────────────────────────────────────────────
+    _banner(logger, "STEP 5 — Model Selection")
+    model_sel_agent = ModelSelectionAgent(model_id=m)
+    model_plan      = model_sel_agent.select_model(
+        dataset_size=collection_result["records_count"],
+        modality=state.modality,
+    )
+    if epochs_override:
+        model_plan["epochs"] = epochs_override
+
+    state.model_hf_id        = model_plan["hf_id"]
+    state.model_name         = model_plan["name"]
+    state.model_architecture = model_plan["architecture"]
+    state.model_vision       = model_plan.get("vision", False)
+    state.lora_r             = model_plan["lora_r"]
+    state.epochs             = model_plan["epochs"]
+    state.batch_size         = model_plan["batch_size"]
+    state.log(f"Model: {state.model_name} ({state.model_hf_id})")
+
+    # ── STEP 6 — Feature Engineering ──────────────────────────────────────────
+    _banner(logger, "STEP 6 — Feature Engineering")
+    fe_agent  = FeatureEngineeringAgent(model_id=m)
+    fe_result = fe_agent.engineer_features(
+        processed_data_path=state.processed_data_path,
+        model_plan=model_plan,
+        device=state.device,
+    )
+    if fe_result.get("status") == "failed":
+        state.errors.append(fe_result.get("message", "Feature engineering failed"))
+        logger.error(f"Feature engineering failed: {fe_result['message']}")
+        state.save()
+        return state
+    state.feature_data_path = fe_result["feature_path"]
+    state.log(
+        f"Features encoded: train={fe_result['train_samples']}  "
+        f"val={fe_result['val_samples']}  path={state.feature_data_path}"
+    )
+
+    # ── STEP 7 — Training ─────────────────────────────────────────────────────
+    if args.skip_training and args.checkpoint:
+        state.checkpoint_path = args.checkpoint
+        state.log(f"Skipping training — checkpoint: {args.checkpoint}")
+    else:
+        _banner(logger, "STEP 7 — Training")
+        training_agent  = TrainingAgent(model_id=m)
+        training_result = training_agent.train(
+            feature_path=state.feature_data_path,
+            model_plan=model_plan,
+            device=state.device,
+            processed_data_path=state.processed_data_path,
+            dataset_size=collection_result["records_count"],
+            modality=state.modality,
+        )
+        if training_result.get("status") == "failed":
+
+            state.retry_count += 1
+            state.failure_reason = training_result.get("failure_reason", "")
+            # FIX: seed previous_models with ALL models training_agent tried
+            # internally (it runs up to 4 retries itself). training_result
+            # contains "excluded_models" — the full list of hf_ids that were
+            # attempted during the internal retry loop.
+            internally_tried = training_result.get("excluded_models", [])
+            last_tried = training_result.get("model_used", "")
+            for m in internally_tried + ([last_tried] if last_tried else []):
+                if m and m not in state.previous_models:
+                    state.previous_models.append(m)
+
+            while state.retry_count <= MAX_MODEL_RETRIES:
+
+                logger.warning(
+                    f"Retry {state.retry_count}/{MAX_MODEL_RETRIES}"
+                )
+
+                # FIX: pass the FULL failed-model history, not just the last one.
+                # training_agent exhausts all 4 internal retries and returns
+                # model_used = only the final attempt. Passing that alone to
+                # select_model means all previously-tried models (instructblip,
+                # llava, phi, qwen) are back in contention for the outer retry
+                # → instructblip is reselected → OOM loop repeats forever.
+                # state.previous_models accumulates every model_used across all
+                # attempts, so passing it excludes the full history.
+                all_failed = list(dict.fromkeys(
+                    state.previous_models
+                    + [training_result.get("model_used", "")]
+                ))
+                retry_plan = model_sel_agent.select_model(
+                    dataset_size=collection_result["records_count"],
+                    modality=state.modality,
+                    failed_models=all_failed,
+                    failure_reason=training_result.get("failure_reason", ""),
+                )
+
+                fe_result = fe_agent.engineer_features(
+                    processed_data_path=state.processed_data_path,
+                    model_plan=retry_plan,
+                    device=state.device,
+                )
+
+                if fe_result.get("status") == "failed":
+                    state.errors.append(
+                        fe_result.get("message", "")
+                    )
+                    break
+                training_result = training_agent.train(
+                    feature_path=fe_result["feature_path"],
+                    model_plan=retry_plan,
+                    device=state.device,
+                    processed_data_path=state.processed_data_path,
+                    dataset_size=collection_result["records_count"],
+                    modality=state.modality,
+                )
+
+                if training_result.get("status") != "failed":
+
+                    state.model_hf_id = retry_plan["hf_id"]
+                    state.model_name = retry_plan["name"]
+                    state.model_architecture = retry_plan["architecture"]
+                    state.model_vision = retry_plan["vision"]
+
+                    state.checkpoint_path = (
+                        training_result["checkpoint_path"]
+                    )
+
+                    # FIX: update model_plan to the plan that actually succeeded.
+                    # Without this, the original model_plan (e.g. instructblip)
+                    # is passed to evaluate() even though a different model
+                    # (e.g. flan-t5 / Qwen) was trained — evaluation then tries
+                    # to load the wrong model class and fails with
+                    # "Unrecognized configuration class".
+                    model_plan = retry_plan
+
+                    break
+
+                state.retry_count += 1
+                state.previous_models.append(
+                    training_result.get("model_used", "")
+                )
+
+            if training_result.get("status") == "failed":
+                state.errors.append(
+                    training_result.get("failure_reason", "")
+                )
+                state.save()
+                return state
+
+
+        state.checkpoint_path = training_result["checkpoint_path"]
+
+        # FIX: always sync state.model_* from training_result["model_used"].
+        # training_agent runs its own internal retry loop and may have trained
+        # a different model than model_plan originally requested. The pipeline
+        # summary, evaluation, and inference must all use the model that was
+        # *actually* trained (and whose checkpoint was saved).
+        actual_hf_id = training_result.get("model_used", "")
+        if actual_hf_id and actual_hf_id != state.model_hf_id:
+            from config.settings import MODEL_CATALOGUE
+            for cat in MODEL_CATALOGUE:
+                if cat["hf_id"].lower() == actual_hf_id.lower():
+                    state.model_hf_id        = cat["hf_id"]
+                    state.model_name         = cat["name"]
+                    state.model_architecture = cat["architecture"]
+                    state.model_vision       = cat.get("vision", False)
+                    # Rebuild model_plan so evaluate() receives correct metadata
+                    model_plan = {**model_plan, **{
+                        "hf_id":         cat["hf_id"],
+                        "name":          cat["name"],
+                        "architecture":  cat["architecture"],
+                        "vision":        cat.get("vision", False),
+                    }}
+                    logger.info(
+                        f"[Main] State reconciled: trained model={actual_hf_id}"
+                    )
+                    break
+
+        state.log(
+            f"Training done. Loss={training_result.get('train_loss','N/A')}  "
+            f"Checkpoint={state.checkpoint_path}"
+        )
+
+    # ── STEP 8 — Evaluation ───────────────────────────────────────────────────
+    _banner(logger, "STEP 8 — Evaluation")
+    eval_agent  = EvaluationAgent(
+        model_id=m,
+        eval_samples=50 if args.dry_run else 200,
+    )
+    eval_result = eval_agent.evaluate(
+        checkpoint_path=state.checkpoint_path,
+        processed_data_path=state.processed_data_path,
+        model_plan=model_plan,
+        device=state.device,
+    )
+    if eval_result.get("status") != "failed":
+        metrics              = eval_result.get("metrics", {})
+        state.bleu_1         = metrics.get("bleu_1",          0.0)
+        state.bleu_4         = metrics.get("bleu_4",          0.0)
+        state.rouge_l        = metrics.get("rouge_l",         0.0)
+        state.exact_match    = metrics.get("exact_match",     0.0)
+        state.medical_accuracy= metrics.get("medical_accuracy",0.0)
+        state.success        = True
+        state.log("Evaluation complete.")
+    else:
+        state.errors.append(eval_result.get("message", "Evaluation failed"))
+
+    state.save()
+    return state
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _banner(logger, title: str) -> None:
+    logger.info("\n" + "="*55)
+    logger.info(f"  {title}")
+    logger.info("="*55)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    setup_logging(args.log_level)
+    logger = logging.getLogger("main")
+
+    logger.info("="*60)
+    logger.info("  Medical VQA — PhiData Multi-Agent Pipeline")
+    logger.info("="*60)
+    logger.info(f"  Image    : {args.image}")
+    logger.info(f"  Question : {args.question}")
+    logger.info(f"  Groq LLM (text reasoning) : {args.groq_model}")
+    logger.info(f"  Groq LLM (vision, modality discovery) : "
+                f"{args.vision_model or '<agent default>'}")
+    logger.info(f"  Dry-run  : {args.dry_run}")
+
+    state = run_pipeline(args)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    logger.info("\n" + "="*60)
+    logger.info("  PIPELINE SUMMARY")
+    logger.info("="*60)
+    logger.info(f"  Status      : {'SUCCESS' if state.success else 'FAILED'}")
+    logger.info(f"  Modality    : {state.modality}")
+    logger.info(f"  Dataset     : {state.dataset_name}")
+    logger.info(f"  Model       : {state.model_name}")
+    logger.info(f"  Features    : {state.feature_data_path}")
+    logger.info(f"  Checkpoint  : {state.checkpoint_path}")
+    if state.success:
+        logger.info(f"  BLEU-1      : {state.bleu_1:.3f}")
+        logger.info(f"  BLEU-4      : {state.bleu_4:.3f}")
+        logger.info(f"  ROUGE-L     : {state.rouge_l:.3f}")
+        logger.info(f"  Exact Match : {state.exact_match:.3f}")
+        logger.info(f"  Medical Acc : {state.medical_accuracy:.3f}")
+    if state.errors:
+        logger.info(f"  Errors      : {state.errors}")
+    logger.info("="*60)
+
+    # ── Inference on input image ───────────────────────────────────────────────
+    if state.checkpoint_path and Path(state.checkpoint_path).exists():
+        logger.info("\n  Running inference on input image …")
+        try:
+            from inference import run_inference
+            answer = run_inference(
+                image_path=args.image,
+                question=args.question,
+                checkpoint_path=state.checkpoint_path,
+                model_hf_id=state.model_hf_id,
+                device=state.device,
+            )
+            logger.info(f"\n  Q : {args.question}")
+            logger.info(f"  A : {answer}\n")
+        except Exception as e:
+            logger.warning(f"  Inference error: {e}")
+
+
+if __name__ == "__main__":
+    main()
