@@ -391,15 +391,15 @@ class TrainingAgent:
         # ── Forced / tuned training params (this revision) ──────────────────
         # epochs is forced to 2 regardless of what ModelSelectionAgent
         # returns, on every attempt and every retry.
-        epochs       = 2
+        epochs       = 3
         # Default learning_rate raised from 8e-5 -> 1.5e-4: LoRA adapters
         # have a tiny trainable parameter count (see print_trainable_parameters
         # log) and tolerate a higher LR well, which speeds convergence within
         # the fixed 2-epoch budget without destabilizing training.
-        lr           = active_plan.get("learning_rate",         1.5e-4)
+        lr           = active_plan.get("learning_rate",         1e-4)
         precision    = active_plan.get("precision",             "fp16")
         max_grad_norm = active_plan.get("max_grad_norm",         1.0)
-        es_patience   = active_plan.get("early_stopping_patience", 2)
+        es_patience   = active_plan.get("early_stopping_patience", 3)
         lr_scheduler  = active_plan.get("lr_scheduler_type",     "cosine")
 
         is_qwen_vl = self._is_qwen_vl(hf_id)
@@ -420,8 +420,17 @@ class TrainingAgent:
         safe_name = name.replace(" ", "_").replace("/", "_")
         out_dir   = CHECKPOINT_DIR / safe_name
         out_dir.mkdir(parents=True, exist_ok=True)
+        existing_adapter = (Path(CHECKPOINT_DIR) / safe_name / "adapter_model.safetensors")
+        if existing_adapter.exists():
+            logger.info(
+                f"[Training] Found existing LoRA adapter at {existing_adapter.parent} — "
+                f"resuming from trained weights instead of fresh LoRA init."
+            )
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, str(existing_adapter.parent), is_trainable=True)
+        else:
+            model = self._apply_lora(model, lora_r, lora_alpha, lora_drop, target_mods, architecture)
 
-        model = self._apply_lora(model, lora_r, lora_alpha, lora_drop, target_mods, architecture)
 
         train_ds, val_ds = self._prepare_columns(train_ds, val_ds, hf_id)
         if len(train_ds) == 0:
