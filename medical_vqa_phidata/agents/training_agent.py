@@ -351,7 +351,7 @@ class TrainingAgent:
         lora_drop    = active_plan.get("lora_dropout",          1)
         target_mods  = active_plan.get("target_modules",        ["q", "v"])
         batch_size   = active_plan.get("batch_size",            2)
-        epochs       = active_plan.get("epochs",                5)
+        epochs       = active_plan.get("epochs",                2)
         lr           = active_plan.get("learning_rate",         8e-5)
         precision    = active_plan.get("precision",             "fp16")
         max_grad_norm = active_plan.get("max_grad_norm",         1.0)
