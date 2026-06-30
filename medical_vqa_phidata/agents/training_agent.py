@@ -43,7 +43,7 @@ always produced via _classify_failure(), in addition to the original
 free-text message kept under "message", so ModelSelectionAgent's
 family-level exclusion logic gets a reliable signal every time.
 
-LABEL-MASKING FAST-FAIL (this revision)
+LABEL-MASKING FAST-FAIL
 -----------------------------------------
 ROOT CAUSE previously found: FeatureEngineeringAgent's vision-chat encoders
 were copying input_ids straight into labels with zero masking, so loss was
@@ -70,6 +70,38 @@ dataset that reached TrainingAgent without a labels column at all) has
 also been removed in favor of failing fast with a clear, actionable error
 — silently fabricating unmasked labels here would just reintroduce the
 exact same bug one layer up.
+
+DUAL-GPU UPDATE (this revision)
+-----------------------------------------
+Previously CUDA_VISIBLE_DEVICES was force-pinned to "0" everywhere in this
+file, because Trainer's distributed/NCCL setup probes for P2P on T4 nodes
+(which lack NVLink) and raises "NCCL Error 1: unhandled cuda error" even
+in nominally single-process runs. That fix avoided NCCL entirely by
+hiding the second GPU from the process.
+
+This revision takes a different, NCCL-free approach to use both GPUs:
+instead of torch.distributed/DDP (which would re-engage the NCCL path
+that was deliberately avoided), the model is now loaded with
+device_map="auto" so HuggingFace's `accelerate` shards the model's
+layers across both visible GPUs (pipeline-style model parallelism, not
+data parallelism). This never initializes a process group and never
+touches NCCL, so it sidesteps the original failure mode entirely.
+
+Both CUDA_VISIBLE_DEVICES force-pins (module level and inside
+_build_trainer) are now "0,1" / removed respectively. Trainer itself
+still runs as a single process — it does not split batches across
+GPUs, it just dispatches into whichever GPU each model layer was
+assigned to. Expect modest, possibly negligible speedup for a model
+that already fits on a single T4 (e.g. 2B param Qwen2-VL) — the value
+here is enabling bigger models / removing pressure on a single GPU.
+
+Also tuned for faster convergence + slightly larger effective batch
+size now that there's more aggregate VRAM headroom across two cards:
+  - default learning_rate raised 8e-5 -> 1.5e-4 (LoRA adapters tolerate
+    a higher LR well since the trainable param count is tiny)
+  - effective batch target raised 16 -> 24 in grad_accum calculation
+  - warmup_steps shortened (faster ramp to full LR)
+  - logging_steps relaxed slightly (less overhead)
 """
 
 from phi.agent import Agent
@@ -80,17 +112,21 @@ import json, logging, os, re
 from pathlib import Path
 
 # ── NCCL / CUDA env vars — must be set BEFORE any torch/CUDA import ──────────
-# T4 GPUs do not support NVLink or InfiniBand peer-to-peer. Without these,
-# NCCL probes for P2P on the first all-reduce and raises "NCCL Error 1:
-# unhandled cuda error" even on single-GPU Trainer runs (because Trainer's
-# ddp setup touches NCCL regardless). Setting them here at module import time
-# guarantees they are in the environment before torch, transformers, or
-# Trainer are ever imported anywhere in the process.
+# T4 GPUs do not support NVLink or InfiniBand peer-to-peer. The NCCL_*_DISABLE
+# vars are kept as a safety net (in case anything ever touches
+# torch.distributed), but the actual multi-GPU strategy used in this file is
+# device_map="auto" model sharding via `accelerate`, NOT torch.distributed/DDP
+# — so NCCL should never actually be invoked during training.
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_IB_DISABLE",  "1")
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"   # force unconditionally — do NOT use setdefault;
-                                             # Kaggle sets this to "0,1" for dual-T4 nodes
-                                             # and setdefault would leave it as "0,1".
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # both T4s visible — model will be
+                                              # sharded across them via
+                                              # device_map="auto" in _load_single.
+                                              # No torch.distributed process
+                                              # group is ever created, so the
+                                              # NCCL P2P issue that forced
+                                              # single-GPU before does not
+                                              # apply to this approach.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 logger = logging.getLogger(__name__)
@@ -227,7 +263,7 @@ class TrainingAgent:
                 return result
 
             # ── NCCL error: retry same model+features, no re-selection ───────
-            # The process group teardown + CUDA_VISIBLE_DEVICES="0" in
+            # The process group teardown + dist.destroy_process_group in
             # _build_trainer will prevent NCCL from being re-initialized.
             # Re-encoding features for the same model is wasteful (5+ min)
             # and unnecessary — the features are correct.
@@ -351,8 +387,16 @@ class TrainingAgent:
         lora_drop    = active_plan.get("lora_dropout",          1)
         target_mods  = active_plan.get("target_modules",        ["q", "v"])
         batch_size   = active_plan.get("batch_size",            2)
-        epochs       = active_plan.get("epochs",                2)
-        lr           = active_plan.get("learning_rate",         8e-5)
+
+        # ── Forced / tuned training params (this revision) ──────────────────
+        # epochs is forced to 2 regardless of what ModelSelectionAgent
+        # returns, on every attempt and every retry.
+        epochs       = 2
+        # Default learning_rate raised from 8e-5 -> 1.5e-4: LoRA adapters
+        # have a tiny trainable parameter count (see print_trainable_parameters
+        # log) and tolerate a higher LR well, which speeds convergence within
+        # the fixed 2-epoch budget without destabilizing training.
+        lr           = active_plan.get("learning_rate",         1.5e-4)
         precision    = active_plan.get("precision",             "fp16")
         max_grad_norm = active_plan.get("max_grad_norm",         1.0)
         es_patience   = active_plan.get("early_stopping_patience", 2)
@@ -542,7 +586,7 @@ class TrainingAgent:
         strategy BEFORE attempting to load the model or build a trainer.
         Returns an empty string if valid, or an error message otherwise.
 
-        Includes a fast-fail check (NEW) for the unmasked-labels bug class:
+        Includes a fast-fail check for the unmasked-labels bug class:
         if labels are an exact copy of input_ids, or are 100% masked, this
         fails immediately instead of letting a full training run complete
         and silently produce a checkpoint with all-zero eval metrics.
@@ -591,7 +635,7 @@ class TrainingAgent:
         except Exception:
             pass
 
-        # ── Unmasked-labels fast-fail (NEW) ─────────────────────────────────
+        # ── Unmasked-labels fast-fail ─────────────────────────────────────
         # Check a small sample of examples, not just one — a single example
         # could coincidentally have its answer span cover (almost) the
         # whole sequence. Checking several makes a false positive unlikely
@@ -636,7 +680,7 @@ class TrainingAgent:
 
         return ""
 
-    # ── Helpers (unchanged from previous version) ────────────────────────────
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _detect_device(self) -> str:
         try:
@@ -723,18 +767,25 @@ class TrainingAgent:
 
         load_kw: Dict = dict(pretrained_model_name_or_path=hf_id, trust_remote_code=True)
 
+        # ── Multi-GPU model sharding ──────────────────────────────────────
+        # device_map="auto" lets `accelerate` split the model's layers
+        # across every GPU visible via CUDA_VISIBLE_DEVICES (now "0,1").
+        # This is model-parallel (pipeline-style) sharding, NOT data-
+        # parallel DDP — it never touches torch.distributed/NCCL, so it
+        # does not reintroduce the P2P/NCCL failure this file previously
+        # avoided by pinning to a single GPU.
         if use_4bit and device == "cuda":
             from transformers import BitsAndBytesConfig
             load_kw["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
             )
-            load_kw["device_map"] = {"": 0}
+            load_kw["device_map"] = "auto"
         elif device == "cuda":
             load_kw["torch_dtype"] = dtype   # FIX: was "dtype" — not a valid kwarg for from_pretrained;
                                               # causes a warning and dtype is silently ignored for some
                                               # model classes (e.g. Qwen2_5_VLForConditionalGeneration).
-            load_kw["device_map"] = {"": 0}
+            load_kw["device_map"] = "auto"
         else:
             load_kw["torch_dtype"] = dtype   # FIX: same kwarg fix for CPU path
 
@@ -1061,10 +1112,11 @@ class TrainingAgent:
         from transformers import TrainingArguments, Trainer, EarlyStoppingCallback, default_data_collator
 
         # ── Destroy any stale NCCL process group ─────────────────────────────
-        # After an NCCL failure, torch.distributed holds a broken process
-        # group. Calling init_process_group again without destroying first
-        # raises "already initialized" errors. Destroying it here before
-        # building the Trainer means the next Trainer.__init__ starts clean.
+        # Kept as a defensive no-op safety net. With device_map="auto" model
+        # sharding (no torch.distributed/DDP in this file), a process group
+        # should never actually be created — but if anything upstream left
+        # one initialized, destroying it here prevents "already initialized"
+        # errors on Trainer.__init__.
         try:
             import torch.distributed as dist
             if dist.is_available() and dist.is_initialized():
@@ -1073,12 +1125,10 @@ class TrainingAgent:
         except Exception as e:
             logger.debug(f"[Training] dist.destroy_process_group skipped: {e}")
 
-        # ── Force single-GPU, no distributed ─────────────────────────────────
-        # CUDA_VISIBLE_DEVICES="0" ensures Trainer sees exactly one GPU and
-        # never attempts to launch a distributed process group. Combined with
-        # the module-level NCCL_P2P_DISABLE / NCCL_IB_DISABLE env vars, this
-        # prevents NCCL from being invoked at all on T4 Kaggle nodes.
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        # NOTE: CUDA_VISIBLE_DEVICES is intentionally NOT re-pinned to "0"
+        # here anymore. The model was already loaded across both GPUs via
+        # device_map="auto" in _load_single — masking devices at this point
+        # would conflict with that sharding instead of preventing NCCL use.
 
         use_fp16 = precision == "fp16" and torch.cuda.is_available()
         use_bf16 = False
@@ -1086,15 +1136,18 @@ class TrainingAgent:
             use_bf16, use_fp16 = True, False
 
         steps_per_epoch = max(1, len(train_ds) // batch_size)
-        warmup_steps    = min(100, max(1, steps_per_epoch // 10))
-        logging_steps   = max(1, steps_per_epoch // 5)
+        # Shorter warmup (faster ramp to full LR) and slightly relaxed
+        # logging cadence (less overhead) — tuned for speed within the
+        # fixed 2-epoch budget.
+        warmup_steps    = min(60, max(1, steps_per_epoch // 15))
+        logging_steps   = max(1, steps_per_epoch // 8)
 
         # Gradient accumulation: compensate for tiny physical batch size.
-        # qwen_vl/phi_vision/llava must use batch=1 to fit on T4, so we
-        # accumulate more steps to keep effective batch size = 8-16.
-        # batch=1 -> accum=16 (effective=16), batch=2 -> accum=8 (effective=16),
-        # batch=4 -> accum=4 (effective=16). Always positive integer.
-        grad_accum = max(1, 16 // max(1, batch_size))
+        # qwen_vl/phi_vision/llava must use batch=1 to fit on a single T4,
+        # so we accumulate more steps to keep effective batch size ~24
+        # (raised from 16): batch=1 -> accum=24, batch=2 -> accum=12,
+        # batch=4 -> accum=6. Always a positive integer.
+        grad_accum = max(1, 24 // max(1, batch_size))
 
         args = TrainingArguments(
             output_dir=out_dir, num_train_epochs=epochs,
