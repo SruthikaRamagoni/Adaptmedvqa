@@ -4,16 +4,6 @@ agents/evaluation_agent.py
 EvaluationAgent — evaluates the trained model with BLEU, ROUGE, EM,
 and Medical Accuracy metrics.
 Uses PhiData Agent with Groq LLM (llama-3.1-8b-instant). Same structure as reference code.
-
-BINARY-CONSTRAINED DECODING (NEW)
------------------------------------
-Questions are classified as binary (yes/no) or open-ended via a lightweight
-heuristic on the question text (_is_binary_question). Binary questions are
-generated under a logits processor that restricts the first generated token
-to only the tokenizer's "yes"/"no" ids (_build_binary_logits_processor),
-guaranteeing a clean yes/no output instead of free text that has to be
-post-hoc interpreted. Open-ended questions are generated exactly as before —
-unconstrained greedy decoding, max_new_tokens=64.
 """
 
 from phi.agent import Agent
@@ -27,12 +17,6 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 REPORT_DIR = Path("./artifacts/evaluation")
-
-_BINARY_LEAD_WORDS = (
-    "is ", "are ", "was ", "were ", "does ", "do ", "did ",
-    "has ", "have ", "had ", "can ", "could ", "will ", "would ",
-    "should ",
-)
 
 
 class EvaluationAgent:
@@ -291,105 +275,23 @@ class EvaluationAgent:
 
         return model, processor
 
-    # ── Binary-question detector (NEW) ──────────────────────────────────────
-
-    def _is_binary_question(self, question: str) -> bool:
-        """
-        Heuristic closed/open split, matching the convention used in VQA-RAD
-        and similar Medical VQA benchmarks: a question is treated as binary
-        (yes/no) if it opens with an auxiliary/modal verb. This runs on the
-        question text alone — it never inspects the ground-truth answer — so
-        it is a valid signal to use before generation, not a form of leakage.
-        """
-        q = (question or "").strip().lower()
-        return q.startswith(_BINARY_LEAD_WORDS)
-
-    # ── Constrained-decoding logits processor (NEW) ─────────────────────────
-
-    def _build_binary_logits_processor(self, tok):
-        """
-        Builds a LogitsProcessor that restricts the FIRST generated token to
-        only the token ids that decode to "yes" or "no" (covering common
-        variants: leading space, capitalized). Returns None if fewer than
-        two such token ids can be resolved for this tokenizer, so callers
-        can safely fall back to unconstrained generation rather than crash
-        on an unusual vocabulary.
-        """
-        import torch
-        from transformers import LogitsProcessor
-
-        candidates = ["yes", "Yes", "YES", " yes", " Yes", "no", "No", "NO", " no", " No"]
-        allowed_ids = set()
-        for word in candidates:
-            try:
-                ids = tok.encode(word, add_special_tokens=False)
-            except Exception:
-                continue
-            # Only keep single-token encodings — multi-token "yes"/"no"
-            # spellings can't be enforced by masking a single decoding step.
-            if len(ids) == 1:
-                allowed_ids.add(ids[0])
-
-        if len(allowed_ids) < 2:
-            logger.warning(
-                "[Evaluation] Could not resolve distinct single-token yes/no "
-                "ids for this tokenizer — binary-constrained decoding "
-                "disabled for this model, falling back to unconstrained "
-                "generation."
-            )
-            return None
-
-        allowed_ids_tensor = torch.tensor(sorted(allowed_ids))
-
-        class _FirstStepYesNoProcessor(LogitsProcessor):
-            """Masks every token except the allowed yes/no ids at generation
-            step 0 only. From step 1 onward the mask is lifted, so a
-            trailing EOS/period the model wants to emit is not blocked."""
-
-            def __init__(self, allowed_ids, prompt_len):
-                self.allowed_ids = allowed_ids
-                self.prompt_len = prompt_len
-
-            def __call__(self, input_ids, scores):
-                # input_ids includes the prompt; only mask when nothing has
-                # been generated yet (current length == prompt length).
-                if input_ids.shape[-1] == self.prompt_len:
-                    mask = torch.full_like(scores, float("-inf"))
-                    ids_on_device = self.allowed_ids.to(scores.device)
-                    mask[:, ids_on_device] = scores[:, ids_on_device]
-                    return mask
-                return scores
-
-        # prompt_len is filled in per-call in _generate_predictions, since it
-        # depends on each record's actual input length.
-        return _FirstStepYesNoProcessor, allowed_ids_tensor
-
     def _generate_predictions(self, model, processor, records, device) -> List[Dict]:
         import torch
         from PIL import Image
 
         if model is None or processor is None:
             logger.error("[Evaluation] model or processor is None — skipping generation.")
-            return [{"question": r.get("question", ""), "ground_truth": r.get("answer", ""),
+            return [{"question": r.get("question",""), "ground_truth": r.get("answer",""),
                      "prediction": ""} for r in records]
 
         tok = getattr(processor, "tokenizer", processor)
         pad_id = getattr(tok, "pad_token_id", None) or getattr(tok, "eos_token_id", 1)
 
-        # Build the binary logits-processor class + allowed ids ONCE per
-        # model, not per-record — resolving token ids is cheap but there is
-        # no reason to repeat it 200+ times.
-        binary_processor_cls, binary_allowed_ids = (None, None)
-        built = self._build_binary_logits_processor(tok)
-        if built is not None:
-            binary_processor_cls, binary_allowed_ids = built
-
         results = []
         for i, rec in enumerate(records):
             question = rec.get("question", "")
-            gt = rec.get("answer", "")
+            gt       = rec.get("answer",   "")
             img_path = rec.get("image_path", "") or rec.get("img_path", "")
-            is_binary = self._is_binary_question(question)
 
             prediction = ""
             try:
@@ -424,11 +326,14 @@ class EvaluationAgent:
 
                     # FIX: pass only the keys the model actually accepts.
                     # Passing extra keys (e.g. token_type_ids) to Qwen2.5-VL
-                    # raises a TypeError and produces no output. Filter to
-                    # the forward-signature keys only.
+                    # raises a TypeError and produces no output. Filter to the
+                    # forward-signature keys only.
                     import inspect
                     try:
                         sig_keys = set(inspect.signature(model.forward).parameters.keys())
+                        # Always keep pixel_values / image_grid_thw even if
+                        # they don't appear by name in the signature (some
+                        # models accept **kwargs)
                         safe_inputs = {
                             k: v for k, v in inputs.items()
                             if k in sig_keys
@@ -438,26 +343,14 @@ class EvaluationAgent:
                     except Exception:
                         safe_inputs = dict(inputs)
 
-                    prompt_len = safe_inputs["input_ids"].shape[-1]
-
-                    gen_kwargs = dict(
+                    out = model.generate(
+                        **safe_inputs,
                         max_new_tokens=64,
                         do_sample=False,
                         pad_token_id=pad_id,
                     )
-
-                    # ── Binary-constrained decoding (NEW) ─────────────────
-                    # Only for questions detected as yes/no AND only when a
-                    # usable processor could be built for this tokenizer.
-                    if is_binary and binary_processor_cls is not None:
-                        from transformers import LogitsProcessorList
-                        gen_kwargs["max_new_tokens"] = 1
-                        gen_kwargs["logits_processor"] = LogitsProcessorList([
-                            binary_processor_cls(binary_allowed_ids, prompt_len)
-                        ])
-
-                    out = model.generate(**safe_inputs, **gen_kwargs)
                     # Decode only the generated tokens (skip the prompt)
+                    prompt_len = safe_inputs["input_ids"].shape[-1]
                     gen_tokens = out[0][prompt_len:]
                     prediction = tok.decode(gen_tokens, skip_special_tokens=True).strip()
 
@@ -468,12 +361,9 @@ class EvaluationAgent:
                 "question": question,
                 "ground_truth": gt,
                 "prediction": prediction,
-                "binary_constrained": is_binary and binary_processor_cls is not None,  # NEW — for auditability
             })
 
         logger.info(f"[Evaluation] Generated {len(results)} predictions.")
-        n_constrained = sum(1 for r in results if r.get("binary_constrained"))
-        logger.info(f"[Evaluation] {n_constrained}/{len(results)} predictions used binary-constrained decoding.")
         # Log a few samples so it's easy to verify output quality in logs
         for s in results[:3]:
             logger.info(
